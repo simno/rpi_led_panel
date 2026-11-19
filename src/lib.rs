@@ -27,6 +27,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod bdf_font;
 mod canvas;
 mod chip;
 mod color;
@@ -36,6 +37,7 @@ mod gpio;
 mod hardware_mapping;
 mod init_sequence;
 mod inputs;
+pub mod ledmatrix_compat;
 mod multiplex_mapper;
 mod named_pixel_mapper;
 mod pin_pulser;
@@ -45,6 +47,7 @@ mod rgb_matrix;
 mod row_address_setter;
 mod utils;
 
+pub use bdf_font::{BdfFont, Glyph};
 pub use canvas::{Canvas, LedSequence};
 pub use chip::PiChip;
 pub use config::RGBMatrixConfig;
@@ -53,6 +56,9 @@ pub use gpio::GpioInitializationError;
 pub use hardware_mapping::HardwareMapping;
 pub use init_sequence::PanelType;
 pub use inputs::{InputChange, InputReader};
+pub use ledmatrix_compat::{
+    LedCanvas, LedColor, LedFont, LedMatrix, LedMatrixOptions, LedRuntimeOptions,
+};
 pub use multiplex_mapper::MultiplexMapperType;
 pub use named_pixel_mapper::{MirrorDirection, NamedPixelMapperType, Rotation};
 pub use rgb_matrix::{MatrixCreationError, RGBMatrix, UpdateThreadError};

@@ -90,6 +90,21 @@ pub enum NamedPixelMapperType {
     ///    └─> Pi connector #1
     /// ```
     ChainLink,
+
+    /// The `VMapper` arranges the parallel chains side by side and the panels of each chain on top of each
+    /// other, like the `V-mapper` of rpi-rgb-led-matrix.
+    ///
+    /// Options, separated by commas:
+    /// - `Z`: every other panel is mounted upside down so that the cables can be shorter.
+    /// - `R`: the panels of every other chain (the right one of each pair) are mounted upside down.
+    ///
+    /// Example: `--pixelmapper V-mapper` or `--pixelmapper V-mapper:Z,R`
+    VMapper {
+        /// Flip every other panel of a chain.
+        z: bool,
+        /// Flip every other chain.
+        flip_right: bool,
+    },
 }
 
 impl FromStr for NamedPixelMapperType {
@@ -121,10 +136,30 @@ impl FromStr for NamedPixelMapperType {
                         ))),
                     }
                 }
+                "V-mapper" => {
+                    let (mut z, mut flip_right) = (false, false);
+                    for option in param.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+                        match option {
+                            "Z" | "z" => z = true,
+                            "R" | "r" => flip_right = true,
+                            other => {
+                                return Err(InvalidPixelMapperError::new(format!(
+                                    "'{other}' is not a valid V-mapper option. Valid options are 'Z' and 'R'"
+                                )));
+                            }
+                        }
+                    }
+                    Ok(Self::VMapper { z, flip_right })
+                }
                 other => Err(InvalidPixelMapperError::new(format!(
                     "'{other}' is not a valid Pixel mapping."
                 ))),
             }
+        } else if s == "V-mapper" {
+            Ok(Self::VMapper {
+                z: false,
+                flip_right: false,
+            })
         } else if s == "U-mapper" {
             Ok(Self::UMapper)
         } else if s == "ChainLink" {
@@ -152,6 +187,12 @@ impl NamedPixelMapperType {
                 chain, parallel,
             )?)),
             NamedPixelMapperType::ChainLink => Ok(Box::new(ChainLinkMapper { parallel })),
+            NamedPixelMapperType::VMapper { z, flip_right } => Ok(Box::new(VerticalMapper {
+                chain,
+                parallel,
+                z,
+                flip_right,
+            })),
         }
     }
 }
@@ -305,9 +346,165 @@ impl PixelMapper for ChainLinkMapper {
     }
 }
 
+struct VerticalMapper {
+    chain: usize,
+    parallel: usize,
+    z: bool,
+    flip_right: bool,
+}
+
+impl PixelMapper for VerticalMapper {
+    fn size_mapping(
+        &self,
+        matrix_width: usize,
+        matrix_height: usize,
+    ) -> Result<[usize; 2], MatrixCreationError> {
+        if !matrix_width.is_multiple_of(self.chain) || !matrix_height.is_multiple_of(self.parallel)
+        {
+            return Err(MatrixCreationError::PixelMapperError(format!(
+                "VerticalMapper: The {matrix_width}x{matrix_height} matrix can't be split into \
+                {} panels wide and {} panels high.",
+                self.chain, self.parallel
+            )));
+        }
+        Ok([
+            matrix_width / self.chain * self.parallel,
+            matrix_height / self.parallel * self.chain,
+        ])
+    }
+
+    fn map_visible_to_matrix(
+        &self,
+        matrix_width: usize,
+        matrix_height: usize,
+        x: usize,
+        y: usize,
+    ) -> [usize; 2] {
+        let panel_width = matrix_width / self.chain;
+        let panel_height = matrix_height / self.parallel;
+        // Each column of panels is one parallel chain, and each row is one position in the chains.
+        let chain_position = y / panel_height;
+        let chain_index = x / panel_width;
+        let x_within_panel = x % panel_width;
+        let y_within_panel = y % panel_height;
+
+        // The panel at the bottom is plugged in first and not flipped, so whether the top one is flipped
+        // depends on the number of panels in the chain. This matches rpi-rgb-led-matrix.
+        let z_flipped = self.z && self.chain % 2 == chain_position % 2;
+        let right_flipped = self.flip_right && chain_index % 2 == 1;
+        // Both flips are half turns, so they cancel each other out.
+        let flipped = z_flipped != right_flipped;
+
+        let [x_within_panel, y_within_panel] = if flipped {
+            [
+                panel_width - 1 - x_within_panel,
+                panel_height - 1 - y_within_panel,
+            ]
+        } else {
+            [x_within_panel, y_within_panel]
+        };
+        [
+            chain_position * panel_width + x_within_panel,
+            chain_index * panel_height + y_within_panel,
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MirrorDirection, NamedPixelMapperType, Rotation};
+    use super::{MirrorDirection, NamedPixelMapperType, PixelMapper, Rotation, VerticalMapper};
+
+    #[test]
+    fn test_parse_v_mapper() {
+        for (text, z, flip_right) in [
+            ("V-mapper", false, false),
+            ("V-mapper:", false, false),
+            ("V-mapper:Z", true, false),
+            ("V-mapper:z", true, false),
+            ("V-mapper:R", false, true),
+            ("V-mapper:R,Z", true, true),
+            ("V-mapper:Z, R", true, true),
+        ] {
+            let mapper: NamedPixelMapperType = text.parse().unwrap();
+            assert_eq!(
+                mapper,
+                NamedPixelMapperType::VMapper { z, flip_right },
+                "{text}"
+            );
+        }
+        assert!("V-mapper:X".parse::<NamedPixelMapperType>().is_err());
+    }
+
+    /// Check that the mapping is a bijection onto the matrix and return it as a lookup function.
+    fn mapping(
+        mapper: &VerticalMapper,
+        width: usize,
+        height: usize,
+    ) -> impl Fn(usize, usize) -> [usize; 2] {
+        let [visible_width, visible_height] = mapper.size_mapping(width, height).unwrap();
+        assert_eq!(visible_width * visible_height, width * height);
+        let mut seen = vec![false; width * height];
+        for y in 0..visible_height {
+            for x in 0..visible_width {
+                let [mx, my] = mapper.map_visible_to_matrix(width, height, x, y);
+                assert!(mx < width && my < height);
+                assert!(!seen[my * width + mx], "({x}, {y}) maps to a pixel twice");
+                seen[my * width + mx] = true;
+            }
+        }
+        move |x, y| mapper.map_visible_to_matrix(width, height, x, y)
+    }
+
+    #[test]
+    fn test_v_mapper_two_parallel_chains() {
+        // Two 128x64 panels on two parallel chains, shown side by side as 256x64.
+        let plain = VerticalMapper {
+            chain: 1,
+            parallel: 2,
+            z: false,
+            flip_right: false,
+        };
+        let map = mapping(&plain, 128, 128);
+        assert_eq!(map(0, 0), [0, 0]);
+        assert_eq!(map(128, 0), [0, 64]);
+        assert_eq!(map(255, 63), [127, 127]);
+
+        let flipped = VerticalMapper {
+            chain: 1,
+            parallel: 2,
+            z: false,
+            flip_right: true,
+        };
+        let map = mapping(&flipped, 128, 128);
+        assert_eq!(map(0, 0), [0, 0]);
+        assert_eq!(map(128, 0), [127, 127]);
+        assert_eq!(map(255, 63), [0, 64]);
+    }
+
+    #[test]
+    fn test_v_mapper_z() {
+        // A chain of three 32x16 panels stacked vertically. The bottom panel isn't flipped.
+        let mapper = VerticalMapper {
+            chain: 3,
+            parallel: 1,
+            z: true,
+            flip_right: false,
+        };
+        let map = mapping(&mapper, 96, 16);
+        assert_eq!(map(0, 0), [0, 0]);
+        assert_eq!(map(0, 16), [63, 15]);
+        assert_eq!(map(0, 32), [64, 0]);
+
+        // Both flips cancel out.
+        let mapper = VerticalMapper {
+            chain: 2,
+            parallel: 2,
+            z: true,
+            flip_right: true,
+        };
+        let map = mapping(&mapper, 64, 32);
+        assert_eq!(map(32, 0), [0, 16]);
+    }
 
     #[test]
     fn test_parse_mirror() {

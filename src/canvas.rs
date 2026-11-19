@@ -368,6 +368,46 @@ impl Canvas {
     pub(crate) fn set_brightness(&mut self, brightness: u8) {
         self.brightness = brightness.clamp(1, 100);
     }
+
+    /// Draw a horizontal line from `x0` to `x1` inclusive, clipped to the canvas.
+    fn draw_horizontal_line(&mut self, x0: i32, x1: i32, y: i32, r: u8, g: u8, b: u8) {
+        let Ok(y) = usize::try_from(y) else {
+            return;
+        };
+        let last_x = self.width() as i32 - 1;
+        for x in x0.max(0)..=x1.min(last_x) {
+            self.set_pixel(x as usize, y, r, g, b);
+        }
+    }
+
+    /// Draw a filled circle around (`x`, `y`). Parts outside of the canvas are ignored.
+    pub fn draw_circle(&mut self, x: i32, y: i32, radius: i32, r: u8, g: u8, b: u8) {
+        if radius < 0 {
+            return;
+        }
+
+        // Midpoint circle algorithm, filling the horizontal spans between the points of each octant.
+        let mut dx = radius;
+        let mut dy = 0;
+        let mut err = 0;
+        while dx >= dy {
+            self.draw_horizontal_line(x - dx, x + dx, y + dy, r, g, b);
+            if dy != 0 {
+                self.draw_horizontal_line(x - dx, x + dx, y - dy, r, g, b);
+            }
+            if dy != dx {
+                self.draw_horizontal_line(x - dy, x + dy, y + dx, r, g, b);
+                self.draw_horizontal_line(x - dy, x + dy, y - dx, r, g, b);
+            }
+
+            dy += 1;
+            err += 1 + 2 * dy;
+            if 2 * (err - dx) + 1 > 0 {
+                dx -= 1;
+                err += 1 - 2 * dx;
+            }
+        }
+    }
 }
 
 #[cfg(feature = "drawing")]

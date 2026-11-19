@@ -1,6 +1,6 @@
-use libc::{
-    CPU_SET, c_int, cpu_set_t, getgrnam, getpwnam, gid_t, sched_setaffinity, setgid, setuid, uid_t,
-};
+#[cfg(target_os = "linux")]
+use libc::{CPU_SET, cpu_set_t, sched_setaffinity};
+use libc::{c_int, getgrnam, getpwnam, gid_t, setgid, setuid, uid_t};
 use std::{
     ffi::CString,
     fs::read_to_string,
@@ -55,6 +55,7 @@ fn cpu_list_contains(cpus: &str, cpu: usize) -> bool {
 }
 
 /// Pin the current thread to a core. Returns whether it succeeded.
+#[cfg(target_os = "linux")]
 #[must_use]
 pub(crate) fn set_thread_affinity(core_id: usize) -> bool {
     let mut set: cpu_set_t = unsafe { std::mem::zeroed() };
@@ -63,6 +64,13 @@ pub(crate) fn set_thread_affinity(core_id: usize) -> bool {
     let mask = &set;
     let res = unsafe { sched_setaffinity(0, cpusetsize, mask) };
     res == 0
+}
+
+/// Thread affinity is Linux-only. This lets the crate build on other systems for development.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub(crate) fn set_thread_affinity(_core_id: usize) -> bool {
+    false
 }
 
 fn gid_from_name(group: &str) -> Option<gid_t> {
@@ -88,7 +96,7 @@ fn set_gid(gid: gid_t) -> io::Result<()> {
 
 fn set_supplementary_groups(gid: gid_t) -> io::Result<()> {
     let groups = [gid];
-    check_libc_result(unsafe { libc::setgroups(groups.len(), groups.as_ptr()) })
+    check_libc_result(unsafe { libc::setgroups(groups.len() as _, groups.as_ptr()) })
 }
 
 fn uid_from_name(user: &str) -> Option<uid_t> {
