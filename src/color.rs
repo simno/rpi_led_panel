@@ -5,7 +5,7 @@ use crate::config::BIT_PLANES;
 static CIE1931: LazyLock<ColorLookup> = LazyLock::new(ColorLookup::new_cie1931);
 
 /// CIE1931 lightness L* (0-100) to relative luminance (0-1).
-fn cie1931(l: f32) -> f32 {
+pub(crate) fn cie1931(l: f32) -> f32 {
     if l <= 8.0 {
         l / 902.3
     } else {

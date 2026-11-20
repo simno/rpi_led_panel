@@ -32,6 +32,8 @@ mod chip;
 mod color;
 mod config;
 mod error;
+#[cfg(feature = "gif")]
+mod gif_animation;
 mod gpio;
 mod hardware_mapping;
 mod init_sequence;
@@ -49,6 +51,8 @@ pub use canvas::{Canvas, LedSequence};
 pub use chip::PiChip;
 pub use config::RGBMatrixConfig;
 pub use error::{InvalidPixelMapperError, InvalidVariantError};
+#[cfg(feature = "gif")]
+pub use gif_animation::{GifAnimation, GifError, GifFrame, ScaleMode};
 pub use gpio::GpioInitializationError;
 pub use hardware_mapping::HardwareMapping;
 pub use init_sequence::PanelType;
