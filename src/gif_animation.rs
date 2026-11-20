@@ -3,8 +3,13 @@
 //! [`GifAnimation`] decodes all frames up front, composites them as the GIF format specifies, and scales them
 //! to the canvas size, so drawing a frame is only a copy. The scaling averages in linear light, which keeps
 //! detail and brightness when shrinking a large GIF onto a small panel.
+//!
+//! To keep memory low, frames are stored with 8 bits per channel, as an index into a palette of the frame's
+//! colors when there are at most 256 of them, and identical consecutive frames are merged. A frame then
+//! takes one byte per pixel, e.g. 16 KiB on a 256x64 display, or three bytes per pixel if it has more colors.
 
 use std::{
+    collections::HashMap,
     error::Error,
     fmt::{self, Display, Formatter},
     fs::File,
@@ -80,13 +85,66 @@ impl From<gif::DecodingError> for GifError {
     }
 }
 
+/// The colors of a frame, with the same meaning as the values passed to [`Canvas::set_pixel`].
+#[derive(Clone, PartialEq, Eq)]
+enum Pixels {
+    /// An index into the palette for every pixel, for frames with at most 256 colors.
+    Indexed {
+        palette: Box<[[u8; 3]]>,
+        indices: Box<[u8]>,
+    },
+    /// The color of every pixel.
+    Rgb(Box<[[u8; 3]]>),
+}
+
+impl Pixels {
+    /// Use a palette if the colors fit into one.
+    fn new(colors: Vec<[u8; 3]>) -> Self {
+        let mut palette: Vec<[u8; 3]> = Vec::new();
+        let mut palette_index: HashMap<[u8; 3], u8> = HashMap::new();
+        let mut indices = Vec::with_capacity(colors.len());
+        for &color in &colors {
+            let index = match palette_index.get(&color) {
+                Some(&index) => index,
+                None => {
+                    let Ok(index) = u8::try_from(palette.len()) else {
+                        return Pixels::Rgb(colors.into_boxed_slice());
+                    };
+                    palette.push(color);
+                    palette_index.insert(color, index);
+                    index
+                }
+            };
+            indices.push(index);
+        }
+        Pixels::Indexed {
+            palette: palette.into_boxed_slice(),
+            indices: indices.into_boxed_slice(),
+        }
+    }
+
+    fn get(&self, index: usize) -> [u8; 3] {
+        match self {
+            Pixels::Indexed { palette, indices } => palette[usize::from(indices[index])],
+            Pixels::Rgb(colors) => colors[index],
+        }
+    }
+
+    /// The memory used for the colors, in bytes.
+    fn size(&self) -> usize {
+        match self {
+            Pixels::Indexed { palette, indices } => size_of_val(&**palette) + indices.len(),
+            Pixels::Rgb(colors) => size_of_val(&**colors),
+        }
+    }
+}
+
 /// One frame of a [`GifAnimation`], already scaled to the canvas size.
 #[derive(Clone)]
 pub struct GifFrame {
     width: usize,
     height: usize,
-    /// Linear light per channel, 0 to `u16::MAX`.
-    pixels: Vec<[u16; 3]>,
+    pixels: Pixels,
     delay: Duration,
 }
 
@@ -107,16 +165,27 @@ impl GifFrame {
         self.delay
     }
 
+    /// The color of a pixel, as it would be passed to [`Canvas::set_pixel`], or `None` outside of the frame.
+    #[must_use]
+    pub fn pixel(&self, x: usize, y: usize) -> Option<[u8; 3]> {
+        (x < self.width && y < self.height).then(|| self.pixels.get(y * self.width + x))
+    }
+
+    /// The memory used for the pixels, in bytes.
+    #[must_use]
+    pub fn memory_size(&self) -> usize {
+        self.pixels.size()
+    }
+
     /// Draw the frame onto the canvas, overwriting every pixel. If the canvas has a different size than the
     /// one the animation was loaded for, the frame is drawn in the top left corner.
     pub fn draw(&self, canvas: &mut Canvas) {
         let width = self.width.min(canvas.width());
         let height = self.height.min(canvas.height());
-        let scale = 1.0 / f32::from(u16::MAX);
         for y in 0..height {
             for x in 0..width {
-                let [r, g, b] = self.pixels[y * self.width + x].map(|c| f32::from(c) * scale);
-                canvas.set_pixel_linear(x, y, r, g, b);
+                let [r, g, b] = self.pixels.get(y * self.width + x);
+                canvas.set_pixel(x, y, r, g, b);
             }
         }
     }
@@ -179,20 +248,25 @@ impl GifAnimation {
 
         let scaler = Scaler::new(source_size, [width, height], mode);
         let mut compositor = Compositor::new(source_size);
-        let mut frames = Vec::new();
+        let mut frames: Vec<GifFrame> = Vec::new();
         while let Some(frame) = decoder.read_next_frame()? {
-            let screen = compositor.add(frame);
             let delay = match Duration::from_millis(u64::from(frame.delay) * 10) {
                 delay if delay < MIN_FRAME_DELAY => DEFAULT_FRAME_DELAY,
                 delay => delay,
             };
-            frames.push(GifFrame {
-                width,
-                height,
-                pixels: scaler.scale(screen),
-                delay,
-            });
+            let pixels = Pixels::new(scaler.scale(compositor.add(frame)));
+            // GIFs often repeat a frame to show it longer, or change only pixels that scaling averages away.
+            match frames.last_mut() {
+                Some(last) if last.pixels == pixels => last.delay += delay,
+                _ => frames.push(GifFrame {
+                    width,
+                    height,
+                    pixels,
+                    delay,
+                }),
+            }
         }
+        frames.shrink_to_fit();
         if frames.is_empty() {
             return Err(GifError::Empty);
         }
@@ -218,10 +292,16 @@ impl GifAnimation {
         self
     }
 
-    /// The frames, scaled to the canvas size.
+    /// The frames, scaled to the canvas size. Identical consecutive frames of the GIF are merged into one.
     #[must_use]
     pub fn frames(&self) -> &[GifFrame] {
         &self.frames
+    }
+
+    /// The memory used for the pixels of all frames, in bytes.
+    #[must_use]
+    pub fn memory_size(&self) -> usize {
+        self.frames.iter().map(GifFrame::memory_size).sum()
     }
 
     /// How long one play of the animation takes.
@@ -345,8 +425,10 @@ struct Scaler {
     /// For every target column, the source columns, or `None` outside of the scaled image.
     columns: Vec<Option<Taps>>,
     rows: Vec<Option<Taps>>,
-    /// Source color (0-255) to linear light.
+    /// Color (0-255) to linear light.
     to_linear: [f32; 256],
+    /// The linear light halfway between consecutive colors, to round linear light to the nearest color.
+    thresholds: [f32; 255],
 }
 
 impl Scaler {
@@ -370,15 +452,24 @@ impl Scaler {
             ScaleMode::Center => [source_width, source_height],
         };
 
+        let to_linear = std::array::from_fn(|c| cie1931(c as f32 * 100.0 / 255.0));
         Self {
             source_width: source[0],
             columns: axis_taps(source[0], scaled_width as usize, target[0]),
             rows: axis_taps(source[1], scaled_height as usize, target[1]),
-            to_linear: std::array::from_fn(|c| cie1931(c as f32 * 100.0 / 255.0)),
+            to_linear,
+            thresholds: std::array::from_fn(|c| (to_linear[c] + to_linear[c + 1]) / 2.0),
         }
     }
 
-    fn scale(&self, image: &[[u8; 4]]) -> Vec<[u16; 3]> {
+    /// The color whose linear light is closest. Colors that went through `to_linear` come back unchanged.
+    fn to_color(&self, linear: f32) -> u8 {
+        self.thresholds
+            .partition_point(|&threshold| threshold < linear) as u8
+    }
+
+    /// Scale the RGBA image to colors for `Canvas::set_pixel`, averaging in linear light.
+    fn scale(&self, image: &[[u8; 4]]) -> Vec<[u8; 3]> {
         let mut pixels = Vec::with_capacity(self.columns.len() * self.rows.len());
         for row in &self.rows {
             for column in &self.columns {
@@ -400,7 +491,7 @@ impl Scaler {
                         }
                     }
                 }
-                pixels.push(sum.map(|c| (c.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16));
+                pixels.push(sum.map(|c| self.to_color(c)));
             }
         }
         pixels
@@ -438,7 +529,7 @@ mod tests {
 
     use gif::{DisposalMethod, Encoder, Frame, Repeat};
 
-    use super::{GifAnimation, ScaleMode, axis_taps};
+    use super::{GifAnimation, Pixels, ScaleMode, Scaler, axis_taps, cie1931};
 
     const WHITE: [u8; 3] = [255, 255, 255];
     const RED: [u8; 3] = [255, 0, 0];
@@ -501,11 +592,10 @@ mod tests {
         );
         let lit = |mode| {
             let animation = load(&data, 8, 8, mode);
-            let pixels = &animation.frames()[0].pixels;
-            let rows: Vec<usize> = (0..8).filter(|y| pixels[y * 8 + 3] != [0; 3]).collect();
-            let columns: Vec<usize> = (0..8)
-                .filter(|x| pixels[2 * 8 + x] != [0; 3] || pixels[4 * 8 + x] != [0; 3])
-                .collect();
+            let frame = &animation.frames()[0];
+            let lit = |x, y| frame.pixel(x, y) != Some([0; 3]);
+            let rows: Vec<usize> = (0..8).filter(|&y| lit(3, y)).collect();
+            let columns: Vec<usize> = (0..8).filter(|&x| lit(x, 2) || lit(x, 4)).collect();
             (rows, columns)
         };
         // Fit: 8x4 in the middle.
@@ -520,7 +610,8 @@ mod tests {
         assert_eq!(lit(ScaleMode::Center), ((3..5).collect(), (2..6).collect()));
 
         let animation = load(&data, 8, 8, ScaleMode::Fit);
-        assert_eq!(animation.frames()[0].pixels[3 * 8], [u16::MAX; 3]);
+        assert_eq!(animation.frames()[0].pixel(0, 3), Some(WHITE));
+        assert_eq!(animation.frames()[0].pixel(8, 3), None);
     }
 
     #[test]
@@ -534,10 +625,14 @@ mod tests {
             &[(0, 0, 2, 2, pixels, DisposalMethod::Keep)],
         );
         let animation = load(&data, 1, 1, ScaleMode::Stretch);
-        let [r, g, b] = animation.frames()[0].pixels[0];
+        let [r, g, b] = animation.frames()[0].pixel(0, 0).unwrap();
         assert_eq!(r, g);
         assert_eq!(g, b);
-        assert!(r.abs_diff(u16::MAX / 2) <= 1, "{r}");
+        let linear = cie1931(f32::from(r) * 100.0 / 255.0);
+        assert!(
+            (linear - 0.5).abs() < 0.01,
+            "{r} is {linear} in linear light"
+        );
     }
 
     #[test]
@@ -555,25 +650,25 @@ mod tests {
             ],
         );
         let animation = load(&data, 2, 1, ScaleMode::Center);
-        let red = [u16::MAX, 0, 0];
-        let white = [u16::MAX; 3];
+        let (red, white) = (Some(RED), Some(WHITE));
         let frames: Vec<_> = animation
             .frames()
             .iter()
-            .map(|f| f.pixels.clone())
+            .map(|f| [f.pixel(0, 0), f.pixel(1, 0)])
             .collect();
         assert_eq!(frames[0], [white, white]);
         assert_eq!(frames[1], [red, white]);
         // The previous frame was restored before drawing this one.
         assert_eq!(frames[2], [white, red]);
         // The area of the previous frame was cleared to transparent, which shows black.
-        assert_eq!(frames[3], [red, [0; 3]]);
+        assert_eq!(frames[3], [red, Some([0; 3])]);
     }
 
     #[test]
     fn test_timing() {
-        let frames: Vec<_> = (0..3)
-            .map(|_| (0, 0, 1, 1, vec![WHITE], DisposalMethod::Keep))
+        let frames: Vec<_> = [WHITE, RED, WHITE]
+            .into_iter()
+            .map(|color| (0, 0, 1, 1, vec![color], DisposalMethod::Keep))
             .collect();
         // Played twice: once, then repeated once.
         let data = encode(1, 1, Repeat::Finite(1), &frames);
@@ -599,6 +694,61 @@ mod tests {
         assert!(!animation.is_finished(Duration::from_secs(1000)));
         assert_eq!(index(&animation, 1000), 2);
         assert_eq!(index(&animation, 1050), 0);
+    }
+
+    #[test]
+    fn test_colors_survive_scaling_unchanged() {
+        let scaler = Scaler::new([1, 1], [1, 1], ScaleMode::Fit);
+        for color in 0..=255u8 {
+            assert_eq!(scaler.to_color(scaler.to_linear[usize::from(color)]), color);
+        }
+        assert_eq!(scaler.to_color(-1.0), 0);
+        assert_eq!(scaler.to_color(2.0), 255);
+    }
+
+    #[test]
+    fn test_memory() {
+        // A 32x16 GIF with a held frame, shown at 64x32.
+        let red = (0, 0, 32, 16, vec![RED; 512], DisposalMethod::Keep);
+        let white = (0, 0, 32, 16, vec![WHITE; 512], DisposalMethod::Keep);
+        let data = encode(
+            32,
+            16,
+            Repeat::Infinite,
+            &[red.clone(), red.clone(), white, red],
+        );
+        let animation = load(&data, 64, 32, ScaleMode::Fit);
+
+        // The repeated frame at the start was merged.
+        let delays: Vec<_> = animation
+            .frames()
+            .iter()
+            .map(|f| f.delay().as_millis())
+            .collect();
+        assert_eq!(delays, [100, 50, 50]);
+        assert_eq!(animation.duration(), Duration::from_millis(200));
+
+        // One byte per pixel plus a one color palette.
+        assert_eq!(animation.memory_size(), 3 * (64 * 32 + 3));
+    }
+
+    #[test]
+    fn test_pixels() {
+        let colors: Vec<[u8; 3]> = (0..512u32)
+            .map(|i| [(i % 256) as u8, (i / 256) as u8, 0])
+            .collect();
+
+        // Up to 256 colors use a palette.
+        let pixels = Pixels::new(colors[..256].repeat(2));
+        assert!(matches!(pixels, Pixels::Indexed { .. }));
+        assert_eq!(pixels.size(), 512 + 256 * 3);
+        assert_eq!(pixels.get(257), [1, 0, 0]);
+
+        // More colors are stored directly.
+        let pixels = Pixels::new(colors.clone());
+        assert!(matches!(pixels, Pixels::Rgb(_)));
+        assert_eq!(pixels.size(), 512 * 3);
+        assert_eq!(pixels.get(257), [1, 1, 0]);
     }
 
     #[test]

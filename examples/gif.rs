@@ -47,10 +47,11 @@ fn main() {
         .looping_forever();
     let [width, height] = animation.source_size();
     println!(
-        "Playing {width}x{height} GIF with {} frames on a {}x{} display",
+        "Playing {width}x{height} GIF with {} frames on a {}x{} display, using {} KiB",
         animation.frames().len(),
         canvas.width(),
-        canvas.height()
+        canvas.height(),
+        animation.memory_size().div_ceil(1024)
     );
 
     let start = Instant::now();

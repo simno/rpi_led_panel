@@ -4,7 +4,7 @@
 
 ### Added
 
-- Add `GifAnimation` behind the `gif` feature to play animated GIFs. Frames are composited as the GIF format specifies and scaled to the canvas size with a choice of `ScaleMode`, averaging in linear light when shrinking. See the `gif` example.
+- Add `GifAnimation` behind the `gif` feature to play animated GIFs. Frames are composited as the GIF format specifies and scaled to the canvas size with a choice of `ScaleMode`, averaging in linear light when shrinking. Frames are stored with a palette when possible, and identical consecutive frames are merged, to keep memory low. See the `gif` example.
 
 ## 0.10.0
 
